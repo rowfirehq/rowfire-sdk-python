@@ -1,4 +1,4 @@
-# rowfire-sdk (Python, prototype)
+# rowfire-sdk-python (prototype)
 
 Business events from inside the app, so Rowfire never needs a database login.
 
@@ -14,11 +14,24 @@ So that someone can write a subscription without reading the code, the SDK
 also sends a **catalog**: the operations the app has, the tables each one
 writes, the columns that change and the values they take.
 
-Rowfire's side is `rowfire ingest` (see the root README's "Pushed events"
-section): point `endpoint` at it and create an `api_key` with
-`rowfire platform ingest-key create`. The SDK's own tests and benchmark run
-against `rowfire_sdk.testing.FakeIngest`; `tests/test_ingest.py` runs this SDK
-against the real ingest server, through to a fire.
+Rowfire's side lives in [rowfirehq/rowfire](https://github.com/rowfirehq/rowfire)
+(see its README, ["Pushed events"](https://github.com/rowfirehq/rowfire#pushed-events-no-database-login)):
+point `endpoint` at a Rowfire that serves `/v1/*` and create an `api_key` with
+`rowfire platform ingest-key create`. This repository's tests and benchmark run
+against `rowfire_sdk.testing.FakeIngest`; Rowfire's own `tests/test_ingest.py`
+runs this SDK against the real ingest server, through to a fire.
+
+Licensed MIT, so it can go into any app; Rowfire's server is AGPL-3.0.
+
+## Installing
+
+```bash
+pip install "rowfire-sdk[sqlalchemy] @ git+https://github.com/rowfirehq/rowfire-sdk-python"
+# or: uv add "rowfire-sdk[sqlalchemy] @ git+https://github.com/rowfirehq/rowfire-sdk-python"
+```
+
+The SDK itself has no dependencies; the `sqlalchemy` extra is only for the
+ORM integration. Not on PyPI yet.
 
 ## Using it
 
@@ -165,7 +178,7 @@ process does everything else. The design follows `sentry-python`
 
 ## Cost
 
-`PYTHONPATH=sdk/python/src uv run python sdk/python/bench/bench_overhead.py`,
+`uv run python bench/bench_overhead.py`,
 one run on a shared cloud container (Python 3.13), so read these as orders of
 magnitude:
 
@@ -209,7 +222,7 @@ for CPU.
 ## Walkthrough
 
 ```bash
-PYTHONPATH=sdk/python/src uv run python sdk/python/examples/walkthrough.py
+uv run python examples/walkthrough.py
 ```
 
 Follows refunds through the SDK: delivered, retried after a 503, rolled back,
@@ -219,7 +232,7 @@ then the catalog the dashboard would receive.
 ## Seeing the traffic
 
 ```bash
-PYTHONPATH=sdk/python/src uv run python sdk/python/examples/send_to_endpoint.py URL
+uv run python examples/send_to_endpoint.py URL
 ```
 
 Runs a small FastAPI app with made-up data and sends its real traffic to `URL`:
@@ -239,9 +252,9 @@ Two client options exist for this and for real networks:
 ## Tests
 
 ```bash
-uv run pytest sdk/python/tests
+uv run pytest
 ```
 
-They also run as part of the root suite. They need SQLAlchemy and FastAPI from
-the root environment; the SDK itself uses only the standard library and
-supports Python 3.9+.
+`uv sync` installs what they need (SQLAlchemy, FastAPI, httpx, pytest; the
+`dev` group). The SDK itself uses only the standard library and supports
+Python 3.9+; CI runs the suite on 3.9 through 3.13.

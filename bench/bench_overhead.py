@@ -1,6 +1,6 @@
 """What the SDK costs the app.
 
-    PYTHONPATH=sdk/python/src uv run python sdk/python/bench/bench_overhead.py
+    uv run python bench/bench_overhead.py
 
 Four measurements, kept apart because they answer different questions:
 

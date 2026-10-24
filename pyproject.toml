@@ -1,14 +1,38 @@
 [project]
 name = "rowfire-sdk"
 version = "0.1.0.dev0"
-description = "Prototype: send business events from inside an app to Rowfire, without giving it database access"
-license = "AGPL-3.0"
+description = "Push business events from inside your app to Rowfire, without granting it database access"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 # Lower than Rowfire's own floor: this runs inside the customer's app.
 requires-python = ">=3.9"
+# The SDK itself uses only the standard library.
 dependencies = []
+keywords = ["rowfire", "events", "sqlalchemy", "fastapi", "webhooks", "sdk"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Framework :: FastAPI",
+]
 
 [project.optional-dependencies]
 sqlalchemy = ["sqlalchemy>=1.4"]
+
+[project.urls]
+Homepage = "https://rowfire.com"
+Source = "https://github.com/rowfirehq/rowfire-sdk-python"
+Server = "https://github.com/rowfirehq/rowfire"
+
+[dependency-groups]
+# What the tests, examples and benchmark use; an app needs none of it.
+dev = [
+    "pytest>=8",
+    "ruff>=0.7",
+    "sqlalchemy>=2",
+    "fastapi>=0.110",
+    "httpx>=0.27",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -17,7 +41,13 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/rowfire_sdk"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.ruff]
-extend = "../../pyproject.toml"
+line-length = 100
 target-version = "py39"
-src = ["src", "tests", "bench"]
+src = ["src", "tests", "bench", "examples"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

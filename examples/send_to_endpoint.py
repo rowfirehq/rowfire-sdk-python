@@ -1,6 +1,6 @@
 """Run a small app with the SDK installed and send its traffic to a real URL.
 
-    PYTHONPATH=sdk/python/src uv run python sdk/python/examples/send_to_endpoint.py URL
+    uv run python examples/send_to_endpoint.py URL
 
 Point it at a request inspector (Pipedream, webhook.site, RequestBin) to see
 exactly what the SDK sends: event batches to `URL/v1/events` and the catalog to

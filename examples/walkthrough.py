@@ -1,6 +1,6 @@
 """Follow refunds through the SDK and print what each component does.
 
-    PYTHONPATH=sdk/python/src uv run python sdk/python/examples/walkthrough.py
+    uv run python examples/walkthrough.py
 
 Each line says which thread it ran on: the app's own thread (what a request
 pays for) or the SDK's background thread (what it does not). The tracing
