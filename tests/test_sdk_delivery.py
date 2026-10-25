@@ -209,6 +209,95 @@ def test_subscriptions_come_from_rowfire_and_are_cached(tmp_path):
         rowfire.close(timeout=0.2)
 
 
+def test_a_process_without_config_counts_what_it_could_not_match(tmp_path):
+    # No cache and Rowfire unreachable: nothing can match, and that is
+    # reported as a loss instead of looking like a quiet day.
+    client = rowfire.init(unused_url(), "k", spool_dir=str(tmp_path), config_interval=60)
+    try:
+        assert client.config_loaded is False
+        checkout(1)
+        checkout(2)
+        assert client.stats()["lost"] == {"no_config": 2}
+    finally:
+        rowfire.close(timeout=0.2)
+
+
+def test_load_config_fetches_before_the_first_match(tmp_path):
+    config = {"version": "v1", "subscriptions": [CHECKOUT]}
+    with FakeIngest(config=config) as ingest:
+        # The background poll would answer much later; load_config answers now.
+        client = rowfire.init(ingest.url, "k", spool_dir=str(tmp_path), config_interval=60)
+        try:
+            assert client.load_config(timeout=1.0) is True
+            assert client.config_loaded and client.matcher.version == "v1"
+            checkout(1)
+            assert rowfire.flush()
+            assert [e["subscription"] for e in ingest.events] == ["checkout"]
+            assert "no_config" not in client.stats()["lost"]
+        finally:
+            rowfire.close(timeout=0.5)
+
+
+def test_an_empty_config_is_still_a_config(tmp_path):
+    # Rowfire answers version null while it holds no definitions.
+    with FakeIngest(config={"version": None, "subscriptions": []}) as ingest:
+        client = rowfire.init(ingest.url, "k", spool_dir=str(tmp_path), config_interval=60)
+        try:
+            assert client.load_config(timeout=1.0) is True
+            checkout(1)
+            assert client.stats()["lost"] == {}
+        finally:
+            rowfire.close(timeout=0.5)
+
+
+def test_load_config_gives_up_quickly_when_rowfire_hangs(tmp_path, hanging_url):
+    client = rowfire.init(hanging_url, "k", spool_dir=str(tmp_path), config_interval=60)
+    try:
+        began = time.perf_counter()
+        assert client.load_config(timeout=0.2) is False
+        assert time.perf_counter() - began < 1.0
+    finally:
+        rowfire.close(timeout=0.2)
+
+
+def test_an_events_only_flush_with_nothing_queued_does_not_wait(tmp_path, hanging_url):
+    # A job that wrote nothing subscribed must not pay for an unreachable Rowfire.
+    client = rowfire.init(hanging_url, "k", subscriptions=[CHECKOUT], spool_dir=str(tmp_path))
+    try:
+        client.worker.ensure_thread()
+        began = time.perf_counter()
+        assert client.flush(timeout=2.0, catalog=False) is True
+        assert time.perf_counter() - began < 0.1
+    finally:
+        rowfire.close(timeout=0.2)
+
+
+def test_a_flush_against_a_hanging_rowfire_spools_by_its_deadline(tmp_path, hanging_url):
+    # What a process about to exit needs: by the deadline the events are on
+    # disk, for the next process to send.
+    client = rowfire.init(
+        hanging_url, "k", subscriptions=[CHECKOUT], spool_dir=str(tmp_path), flush_interval=60
+    )
+    try:
+        checkout(1)
+        checkout(2)
+        began = time.perf_counter()
+        client.flush(timeout=0.5, catalog=False)
+        assert time.perf_counter() - began < 1.5
+        assert client.stats()["waiting_in_spool"] == 2
+    finally:
+        rowfire.close(timeout=0.2)
+
+
+@pytest.fixture
+def hanging_url():
+    """An address that takes connections and never answers them."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        s.listen(16)
+        yield f"http://127.0.0.1:{s.getsockname()[1]}"
+
+
 def test_nothing_happens_before_init():
     rowfire.close()
     checkout(1)

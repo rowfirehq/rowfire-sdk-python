@@ -12,6 +12,7 @@ import http.client
 import json
 import logging
 import os
+import threading
 import time
 from collections.abc import Collection, Mapping, Sequence
 from typing import Any, Callable
@@ -98,6 +99,11 @@ class Client:
         self._catalog_now = False
         self.catalog_errors = 0
         self._static = subscriptions is not None
+        # Whether any set of subscriptions is known yet: given in code, read
+        # from the cache, or fetched. Not the same as having a version, which
+        # Rowfire leaves null while it holds no definitions.
+        self.config_loaded = self._static
+        self._config_lock = threading.Lock()
         self.config_errors = 0
         self._transport = Transport(endpoint, api_key, timeout, compress, proxy)
         self._spool: Any = MemorySpool(spool_max_bytes)
@@ -156,6 +162,7 @@ class Client:
             log.warning("rowfire-sdk: subscription %s rejected: %s", sub_id, reason)
         # One assignment, so the request thread sees the old set or the new one.
         self.matcher = matcher
+        self.config_loaded = True
 
     def _tick(self, final: bool = False) -> None:
         """Background thread, once per cycle: config in, catalog out."""
@@ -184,17 +191,42 @@ class Client:
         if now < self._next_config:
             return
         self._next_config = now + self._config_interval
+        self._fetch_config(self._transport, None)
+
+    def load_config(self, timeout: float = 1.0) -> bool:
+        """Fetch the subscriptions now, if none are known yet; True if some are.
+
+        For a process that must not start blind: a job runner that forks a
+        new process per job, or one without a `spool_dir` to cache config in.
+        Until the background thread's first poll answers, such a process
+        matches nothing. It runs on the caller's thread, on a connection of its
+        own, and waits at most `timeout`.
+        """
+        if self.config_loaded:
+            return True
+        transport = self._transport.copy()
         try:
-            status, etag, config = self._transport.fetch_config(self._etag)
+            self._fetch_config(transport, timeout)
+        finally:
+            transport.close()
+        return self.config_loaded
+
+    def _fetch_config(self, transport: Transport, timeout: float | None) -> None:
+        try:
+            status, etag, config = transport.fetch_config(self._etag, timeout)
         except (OSError, http.client.HTTPException, ValueError):
             self.config_errors += 1
             return
         if config is None:
-            if status != 304:
+            if status == 304:
+                self.config_loaded = True
+            else:
                 self.config_errors += 1
             return
-        self._etag = etag
-        self.set_subscriptions(config.get("subscriptions", []), config.get("version"))
+        with self._config_lock:
+            self._etag = etag
+            self.set_subscriptions(config.get("subscriptions", []), config.get("version"))
+            self.config_loaded = True
         self._write_cached_config(config)
 
     def _load_cached_config(self) -> None:
@@ -206,6 +238,7 @@ class Client:
         except (OSError, ValueError):
             return
         self.set_subscriptions(config.get("subscriptions", []), config.get("version"))
+        self.config_loaded = True
 
     def _write_cached_config(self, config: dict[str, Any]) -> None:
         if not self._config_cache:
@@ -221,10 +254,20 @@ class Client:
     # -- request thread -------------------------------------------------------
 
     def subscriptions_for(self, op: Operation | None, table: str) -> list[Subscription]:
+        if not self.config_loaded:
+            self._blind()
         return self.matcher.resolve(op.name if op else NO_OPERATION).tables.get(table, [])
 
     def watches_tables(self, op: Operation | None) -> bool:
+        if not self.config_loaded:
+            self._blind()
         return bool(self.matcher.resolve(op.name if op else NO_OPERATION).tables)
+
+    def _blind(self) -> None:
+        # Nothing can match yet, and nothing would say so: count each write
+        # or operation seen meanwhile, so Rowfire shows the blind spot as a
+        # loss rather than as a quiet day.
+        self.counters.lose("no_config")
 
     def match_change(
         self, op: Operation | None, subs: list[Subscription], change: Change
@@ -278,6 +321,9 @@ class Client:
     def operation_finished(self, op: Operation) -> None:
         if op.status is not None and op.status >= 400:
             return
+        if not self.config_loaded:
+            self._blind()
+            return
         resolved = self.matcher.resolve(op.name)
         if not resolved.on_complete:
             return
@@ -309,10 +355,17 @@ class Client:
 
     # -- lifecycle --------------------------------------------------------------
 
-    def flush(self, timeout: float = 2.0) -> bool:
-        """Send queued events now, and the catalog if it changed."""
-        self._catalog_now = True
-        return self.worker.flush(timeout)
+    def flush(self, timeout: float = 2.0, catalog: bool = True) -> bool:
+        """Send queued events now, and the catalog if it changed.
+
+        With `catalog=False` it waits only for the events (delivered, or kept
+        in the spool), and returns at once when none are queued: what a
+        process about to exit calls, so an unreachable Rowfire costs it
+        nothing when it has nothing to send.
+        """
+        if catalog:
+            self._catalog_now = True
+        return self.worker.flush(timeout, events_only=not catalog)
 
     def close(self, timeout: float = 2.0) -> None:
         self.worker.close(timeout)
@@ -326,6 +379,7 @@ class Client:
             "spool": self.spool_kind,
             "lost": dict(self.counters.lost_total),
             "config_version": self.matcher.version,
+            "config_loaded": self.config_loaded,
             "config_errors": self.config_errors,
             "catalog_errors": self.catalog_errors,
             "rejected_subscriptions": list(self.matcher.rejected),

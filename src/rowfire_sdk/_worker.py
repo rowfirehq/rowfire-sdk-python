@@ -123,7 +123,10 @@ class Worker:
         self._lock = threading.Lock()
         self._buffer: list[dict[str, Any]] = []
         self._wake = threading.Event()
-        self._waiters: list[threading.Event] = []
+        # (event, events_only, deadline): an events-only waiter is let go once
+        # the events are out, before the cycle polls config and sends the
+        # catalog; by its deadline, whatever is not sent is in the spool.
+        self._waiters: list[tuple[threading.Event, bool, float]] = []
         self._guard = threading.local()
         self._thread: threading.Thread | None = None
         self._pid: int | None = None
@@ -189,18 +192,25 @@ class Worker:
 
     # -- callers that may wait ------------------------------------------------
 
-    def flush(self, timeout: float = 2.0) -> bool:
+    def flush(self, timeout: float = 2.0, events_only: bool = False) -> bool:
         """Send what is buffered now; True if that finished within `timeout`.
 
-        "Finished" means delivered, or kept in the spool for a retry.
+        "Finished" means delivered, or kept in the spool for a retry. With
+        `events_only`, it does not wait for the config poll and catalog that
+        share the cycle, and does not wait at all when nothing is buffered and
+        no loss is waiting to be reported.
         """
         if self._thread is None or self._pid != os.getpid() or not self._running:
             return not self._buffer
+        if events_only and not self._buffer and not self._counters.lost:
+            return True
         done = threading.Event()
         with self._lock:
-            self._waiters.append(done)
+            self._waiters.append((done, events_only, time.monotonic() + timeout))
         self._wake.set()
-        return done.wait(timeout)
+        # An events flush waits a little past its deadline: the cycle needs a
+        # moment to spool what it could not send by then.
+        return done.wait(timeout + 0.25 if events_only else timeout)
 
     def close(self, timeout: float = 2.0) -> None:
         """Stop the thread after one last cycle, bounded by `timeout`.
@@ -225,15 +235,24 @@ class Worker:
             self._wake.clear()
             with self._lock:
                 waiters, self._waiters = self._waiters, []
+            # Events first: a config poll or catalog send that hangs on an
+            # unreachable Rowfire must not hold up a flush waiting on events.
+            # A flush's deadline bounds the sends; past it, batches are spooled,
+            # so a process about to exit leaves them for the next one.
+            deadline = min((d for _, _, d in waiters), default=None)
+            self._run_safely(lambda deadline=deadline: self._cycle(deadline))
+            for waiter, events_only, _ in waiters:
+                if events_only:
+                    waiter.set()
             self._run_safely(self._tick)
-            self._run_safely(self._cycle)
-            for waiter in waiters:
-                waiter.set()
+            for waiter, events_only, _ in waiters:
+                if not events_only:
+                    waiter.set()
         self._run_safely(lambda: self._cycle(self._final_deadline))
         self._run_safely(lambda: self._tick(final=True))
         with self._lock:
             waiters, self._waiters = self._waiters, []
-        for waiter in waiters:
+        for waiter, _, _ in waiters:
             waiter.set()
 
     def _next_wait(self) -> float:

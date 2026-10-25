@@ -59,6 +59,30 @@ with rowfire.operation("job AutoRefundWorker", actor={"role": "system"}):
 The middleware names a request by its route *template*
 (`POST /charges/{id}/refund`), not the URL.
 
+### Frappe and ERPNext (prototype)
+
+`rowfire_sdk.integrations.frappe` does the same for a Frappe site, from
+Frappe's own hooks rather than an ORM's: a document's `on_change` and
+`after_delete` are the writes, the doctype is the table, and a request is
+named by its route template, or by what a desk action does
+(`desk Submit Sales Invoice`). A job is `job <method>`. Install it with the
+Frappe app [rowfirehq/rowfire_frappe](https://github.com/rowfirehq/rowfire_frappe),
+which wires these functions into `hooks.py` (Frappe calls hooks only inside
+an installed app), and turn it on per site in `site_config.json`:
+
+```json
+"rowfire_endpoint": "https://rowfire.internal",
+"rowfire_api_key": "rf_...",
+"rowfire": {"ceiling": {"deny_fields": ["*email*"]}}
+```
+
+A bench serves several sites from one process, so there is one client per
+site. Writes are coalesced per document per transaction, matched just before
+commit, and the documents that matched are read back then, so a savepoint
+rolled back inside a committed transaction sends nothing. Not seen: child-table
+rows, and writes that bypass `Document` (`frappe.db.set_value`, query builder
+and SQL updates).
+
 ## Subscriptions
 
 ```json
@@ -175,6 +199,18 @@ process does everything else. The design follows `sentry-python`
   can drop the copy a retry makes. When an event is lost (the in-memory queue
   is full, the spool is over its cap, or Rowfire rejected the batch), the count
   and reason go to Rowfire with the next batch and to `stats()`.
+- **A process that has no subscriptions yet says so.** Until config is given
+  in code, read from the cache in `spool_dir`, or fetched, nothing can match;
+  each write and operation seen meanwhile is counted as lost with the reason
+  `no_config`. A process that must not start blind (a job runner that forks
+  per job, one without a writable `spool_dir`) calls
+  `client.load_config(timeout=1.0)` first: one request, on its own
+  connection, bounded by the timeout.
+- **A process about to exit flushes events only.** `client.flush(timeout,
+  catalog=False)` returns at once when nothing is queued, and otherwise
+  sends until the deadline and puts the rest in the spool, so an unreachable
+  Rowfire costs it at most `timeout`, and nothing at all when it has nothing
+  to send. Events go before the config poll and the catalog in each cycle.
 
 ## Cost
 
@@ -214,8 +250,11 @@ for CPU.
   default ceiling.
 - Core SQL (`session.execute(update(...))`) bypasses the ORM's unit of work and
   is not seen.
-- An event matched inside a SAVEPOINT that rolls back while the outer
-  transaction commits is still sent.
+- With SQLAlchemy, an event matched inside a SAVEPOINT that rolls back while
+  the outer transaction commits is still sent. (The Frappe integration reads
+  matched documents back before commit, which covers it there.)
+- Frappe: child-table rows, and writes that bypass `Document`. Its tests need
+  a Frappe site, so they are not in this suite yet.
 - Django, Celery and other integrations, and an outbox option for
   events that must survive a crash between commit and send.
 
