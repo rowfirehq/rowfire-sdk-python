@@ -70,6 +70,12 @@ class Transport:
         self.compress = compress
         self.proxy = resolve_proxy(proxy, parts.scheme, self._host)
         self._conn: http.client.HTTPConnection | None = None
+        self._settings = (endpoint, api_key, timeout, compress, proxy)
+
+    def copy(self) -> Transport:
+        """The same settings on a connection of its own. One connection serves
+        one thread: this is for a request made outside the background thread."""
+        return Transport(*self._settings)
 
     def send_batch(self, body: bytes, timeout: float | None = None) -> Outcome:
         return self.post("/v1/events", body, timeout)
@@ -91,10 +97,12 @@ class Transport:
             return Outcome(RETRY, f"status_{status}", _retry_after(headers.get("retry-after")))
         return Outcome(REJECT, f"status_{status}")
 
-    def fetch_config(self, etag: str | None) -> tuple[int, str | None, dict[str, Any] | None]:
+    def fetch_config(
+        self, etag: str | None, timeout: float | None = None
+    ) -> tuple[int, str | None, dict[str, Any] | None]:
         """(status, etag, config); config is None unless the status is 200."""
         headers = {"If-None-Match": etag} if etag else {}
-        status, response_headers, data = self._request("GET", "/v1/config", None, headers, None)
+        status, response_headers, data = self._request("GET", "/v1/config", None, headers, timeout)
         if status != 200:
             return status, etag, None
         return status, response_headers.get("etag"), json.loads(data)

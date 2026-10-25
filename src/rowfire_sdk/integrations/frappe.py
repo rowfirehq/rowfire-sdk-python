@@ -79,6 +79,9 @@ from rowfire_sdk._matching import Ceiling
 log = logging.getLogger("rowfire_sdk")
 
 _clients: dict[str, Client | None] = {}
+# Settings of this integration, read from the site's `rowfire` block (seconds).
+_DEFAULTS = {"config_timeout": 1.0, "job_flush_timeout": 2.0, "job_catalog_timeout": 0.25}
+_settings: dict[str, dict[str, float]] = {}
 _TX = "rowfire_tx"
 _OP = "rowfire_op"
 
@@ -101,6 +104,8 @@ def get_client() -> Client | None:
         return None
     try:
         options = dict(conf.get("rowfire") or {})
+        # This integration's own settings; the rest are `Client` options.
+        _settings[site] = {k: float(options.pop(k, v)) for k, v in _DEFAULTS.items()}
         ceiling = options.pop("ceiling", None)
         if ceiling is not None:
             options["ceiling"] = Ceiling(**ceiling)
@@ -119,11 +124,20 @@ def get_client() -> Client | None:
         # `rowfire_sdk.init`'s atexit closes only its own client.
         atexit.register(_close_all)
     _clients[site] = client
+    if not client.config_loaded:
+        # Nothing cached to start from (a first start, or no writable
+        # spool_dir): ask once, briefly, rather than run blind until the
+        # background thread's first poll answers.
+        client.load_config(timeout=_settings[site]["config_timeout"])
     try:
         _declare(client)
     except Exception:
         log.exception("rowfire-sdk: could not list the site's operations")
     return client
+
+
+def _setting(name: str) -> float:
+    return _settings.get(frappe.local.site, _DEFAULTS)[name]
 
 
 def _close_all() -> None:
@@ -139,9 +153,12 @@ def _declare(client: Client) -> None:
     if client.catalog is None:
         return
     names = [
-        f"job {t}" for t in frappe.get_all("Scheduled Job Type", pluck="method", filters={"stopped": 0})
+        f"job {t}"
+        for t in frappe.get_all("Scheduled Job Type", pluck="method", filters={"stopped": 0})
     ]
-    for doctype in frappe.get_all("DocType", pluck="name", filters={"is_submittable": 1, "istable": 0}):
+    for doctype in frappe.get_all(
+        "DocType", pluck="name", filters={"is_submittable": 1, "istable": 0}
+    ):
         names += [f"desk Submit {doctype}", f"desk Cancel {doctype}"]
     client.declare_operations(sorted(names))
 
@@ -210,6 +227,7 @@ def _request_name() -> str | None:
             name = _desk_name(rpc)
             if name:
                 return name
+
         # The doctype and the RPC are part of what the operation is; the
         # document's name is a parameter.
         def fill(m: re.Match) -> str:
@@ -274,7 +292,9 @@ def _actor() -> dict[str, Any]:
         actor["type"] = user
         return actor
     try:
-        user_type, profile = frappe.get_cached_value("User", user, ["user_type", "role_profile_name"])
+        user_type, profile = frappe.get_cached_value(
+            "User", user, ["user_type", "role_profile_name"]
+        )
         actor["type"] = user_type
         if profile:
             actor["role_profile"] = profile
@@ -290,10 +310,10 @@ def before_job(method: str = "", kwargs: Any = None, transaction_type: str = "jo
     client = get_client()
     if client is None:
         return
-    if not client._static and client.matcher.version is None:
+    if not client.config_loaded:
         # A new process per job: nothing cached yet, so ask before the job
         # writes anything, or its writes are matched against no subscription.
-        client._poll_config()
+        client.load_config(timeout=_setting("config_timeout"))
     name = method
     if method.endswith("run_scheduled_job") and isinstance(kwargs, dict):
         name = kwargs.get("job_type") or method
@@ -312,9 +332,16 @@ def after_job(method: str = "", kwargs: Any = None, result: Any = None) -> None:
         if not failed:
             client.operation_finished(op)
         client.observe_operation(op, failed)
-        # The job's process may be a fork that leaves with os._exit: send
-        # now, or what is queued dies with it (the disk spool keeps the rest).
-        client.flush(timeout=float((frappe.local.conf.get("rowfire") or {}).get("job_flush_timeout", 2.0)))
+        # The job's process may be a fork that leaves with os._exit, so its
+        # events go now: delivered, or by the deadline put in the spool for
+        # the next process. Without events this returns at once, so a Rowfire
+        # that is down costs a job nothing.
+        client.flush(timeout=_setting("job_flush_timeout"), catalog=False)
+        # The catalog is worth a short wait, not a slow job; and none while
+        # batches wait in the spool (this job's, or ones earlier jobs left
+        # there), since Rowfire is then behind or down.
+        if not client.stats()["waiting_in_spool"]:
+            client.flush(timeout=_setting("job_catalog_timeout"))
     except Exception:
         log.exception("rowfire-sdk: could not finish the job")
     finally:
@@ -436,14 +463,23 @@ def _still_true(doctype: str, name: str, kind: str, events: list, subs: list, me
     if kind == "delete":
         return not frappe.db.exists(doctype, name)
     matched = {e["subscription"] for e in events}
-    wanted = [(path[4:], expected) for sub in subs if sub.id in matched for path, expected in sub.where if path.startswith("row.")]
+    wanted = [
+        (path[4:], expected)
+        for sub in subs
+        if sub.id in matched
+        for path, expected in sub.where
+        if path.startswith("row.")
+    ]
     keys = sorted({k for k, _ in wanted} | {"docstatus"})
     stored = frappe.db.get_value(doctype, name, keys, as_dict=True)
     if not stored:
         return False
     _, numeric = _columns(meta)
     now = _snapshot(SimpleNamespace(**stored, doctype=doctype), tuple(keys), numeric)
-    return all(now[k] in expected if isinstance(expected, list) else now[k] == expected for k, expected in wanted)
+    return all(
+        now[k] in expected if isinstance(expected, list) else now[k] == expected
+        for k, expected in wanted
+    )
 
 
 def _after_commit(client: Client, tx: dict[str, Any]) -> None:
@@ -542,7 +578,12 @@ def _date_text(v: Any) -> str:
 _STANDARD = {
     "name": {"type": "data", "nullable": False, "primary_key": True},
     "owner": {"type": "link", "nullable": True, "primary_key": False, "references": ["User.name"]},
-    "modified_by": {"type": "link", "nullable": True, "primary_key": False, "references": ["User.name"]},
+    "modified_by": {
+        "type": "link",
+        "nullable": True,
+        "primary_key": False,
+        "references": ["User.name"],
+    },
     "creation": {"type": "datetime", "nullable": True, "primary_key": False},
     "modified": {"type": "datetime", "nullable": True, "primary_key": False},
     "docstatus": {
